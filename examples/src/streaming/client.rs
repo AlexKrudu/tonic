@@ -2,85 +2,85 @@ pub mod pb {
     tonic::include_proto!("grpc.examples.echo");
 }
 
+use std::io;
+use std::io::Write;
 use futures::stream::Stream;
 use std::time::Duration;
+use futures::{TryStreamExt};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
 use pb::{echo_client::EchoClient, EchoRequest};
+use tonic::{IntoStreamingRequest, Streaming};
 
-fn echo_requests_iter() -> impl Stream<Item = EchoRequest> {
-    tokio_stream::iter(1..usize::MAX).map(|i| EchoRequest {
-        message: format!("msg {:02}", i),
-    })
+struct RawClient {
+    service: EchoClient<Channel>,
 }
 
-async fn streaming_echo(client: &mut EchoClient<Channel>, num: usize) {
-    let stream = client
-        .server_streaming_echo(EchoRequest {
-            message: "foo".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
+struct SomeWrapper{
+    tx: tokio::sync::mpsc::UnboundedSender<EchoRequest>,
+    response_stream: Streaming<crate::pb::EchoResponse>,
+}
 
-    // stream is infinite - take just 5 elements and then disconnect
-    let mut stream = stream.take(num);
-    while let Some(item) = stream.next().await {
-        println!("\treceived: {}", item.unwrap().message);
+impl SomeWrapper{
+    pub async fn send(&mut self, message: String){
+        self.tx.send(EchoRequest{message: "123".to_string()}).expect("TODO")
     }
-    // stream is droped here and the disconnect info is send to server
-}
 
-async fn bidirectional_streaming_echo(client: &mut EchoClient<Channel>, num: usize) {
-    let in_stream = echo_requests_iter().take(num);
-
-    let response = client
-        .bidirectional_streaming_echo(in_stream)
-        .await
-        .unwrap();
-
-    let mut resp_stream = response.into_inner();
-
-    while let Some(received) = resp_stream.next().await {
-        let received = received.unwrap();
-        println!("\treceived message: `{}`", received.message);
+    pub async fn receive(&mut self) -> Option<crate::pb::EchoResponse>{
+        if let Some(receive_result) = self.response_stream.next().await {
+            return Some(receive_result.unwrap());
+        }
+        return None;
     }
 }
 
-async fn bidirectional_streaming_echo_throttle(client: &mut EchoClient<Channel>, dur: Duration) {
-    let in_stream = echo_requests_iter().throttle(dur);
+impl RawClient {
+    pub async fn streaming_echo(&mut self) -> SomeWrapper {
+        let (tx, rx): (tokio::sync::mpsc::UnboundedSender<EchoRequest>, tokio::sync::mpsc::UnboundedReceiver<EchoRequest>) = tokio::sync::mpsc::unbounded_channel();
 
-    let response = client
-        .bidirectional_streaming_echo(in_stream)
-        .await
-        .unwrap();
+        let request_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).throttle(Duration::from_secs(1));
 
-    let mut resp_stream = response.into_inner();
+        let response_stream = self.service
+            .bidirectional_streaming_echo(request_stream)
+            .await
+            .unwrap().into_inner();
 
-    while let Some(received) = resp_stream.next().await {
-        let received = received.unwrap();
-        println!("\treceived message: `{}`", received.message);
+        println!("Successfull init");
+        return SomeWrapper{tx, response_stream};
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = EchoClient::connect("http://[::1]:50051").await.unwrap();
+    /*let send_fut = tokio::spawn(
+         async move {
+             let stdin = tokio::io::stdin();
+             let mut reader = BufReader::new(stdin).lines();
+             loop {
+                 if let Ok(Some(line)) = reader.next_line().await {
+                     tx.send(EchoRequest{message: line.clone()}).unwrap();
+                 } else {
+                     eprintln!("Ошибка чтения из stdin");
+                     break;
+                 }
+             }
+         }
+     );*/ // reads lines from stdin and echoes
 
-    println!("Streaming echo:");
-    streaming_echo(&mut client, 5).await;
-    tokio::time::sleep(Duration::from_secs(1)).await; //do not mess server println functions
 
-    // Echo stream that sends 17 requests then graceful end that connection
-    println!("\r\nBidirectional stream echo:");
-    bidirectional_streaming_echo(&mut client, 17).await;
+    let mut client = RawClient { service: EchoClient::connect("http://[::1]:50052").await.unwrap() };
 
-    // Echo stream that sends up to `usize::MAX` requests. One request each 2s.
-    // Exiting client with CTRL+C demonstrate how to distinguish broken pipe from
-    // graceful client disconnection (above example) on the server side.
-    println!("\r\nBidirectional stream echo (kill client with CTLR+C):");
-    bidirectional_streaming_echo_throttle(&mut client, Duration::from_secs(2)).await;
-
+    let mut wrapper = client.streaming_echo().await;
+    //let fut = bidirectional_streaming_echo_throttle(client, Duration::from_secs(2));
+    loop {
+        wrapper.send("123".to_string()).await;
+        if let Some(resp) = wrapper.receive().await{
+            println!("{}", resp.message);
+        }
+    }
+    //fut.await;
+    //send_fut.await.unwrap();
     Ok(())
 }
